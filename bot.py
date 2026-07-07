@@ -27,6 +27,11 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
 # ===================== FSM STATES =====================
+class UserReg(StatesGroup):
+    full_name = State()
+    age       = State()
+    region    = State()
+
 class AiChat(StatesGroup):
     chatting = State()
 
@@ -72,6 +77,10 @@ def init_db():
             user_id     INTEGER PRIMARY KEY,
             username    TEXT,
             first_name  TEXT,
+            full_name   TEXT,
+            age_group   TEXT,
+            region      TEXT,
+            is_registered INTEGER DEFAULT 0,
             joined_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_seen   DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -175,6 +184,34 @@ def db_upsert_user(user_id: int, username: str, first_name: str):
     conn.commit()
     conn.close()
 
+def db_get_user(user_id: int) -> dict | None:
+    """Foydalanuvchi ma'lumotlarini olish."""
+    conn = sqlite3.connect(DB)
+    row = conn.execute(
+        "SELECT user_id, full_name, age_group, region, is_registered FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "user_id": row[0],
+        "full_name": row[1],
+        "age_group": row[2],
+        "region": row[3],
+        "is_registered": row[4],
+    }
+
+def db_complete_registration(user_id: int, full_name: str, age_group: str, region: str):
+    """Ro'yxatdan o'tishni yakunlash."""
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        UPDATE users SET full_name=?, age_group=?, region=?, is_registered=1
+        WHERE user_id=?
+    """, (full_name, age_group, region, user_id))
+    conn.commit()
+    conn.close()
+
 def db_log_event(user_id: int, event_type: str,
                  symptom_text: str = None,
                  specialty: str = None,
@@ -245,6 +282,30 @@ def db_get_stats() -> dict:
         ORDER BY day
     """).fetchall()
 
+    # Viloyatlar bo'yicha taqsimot
+    region_stats = c.execute("""
+        SELECT region, COUNT(*) as cnt
+        FROM users
+        WHERE region IS NOT NULL AND is_registered=1
+        GROUP BY region
+        ORDER BY cnt DESC
+        LIMIT 5
+    """).fetchall()
+
+    # Yosh guruhlari bo'yicha taqsimot
+    age_stats = c.execute("""
+        SELECT age_group, COUNT(*) as cnt
+        FROM users
+        WHERE age_group IS NOT NULL AND is_registered=1
+        GROUP BY age_group
+        ORDER BY cnt DESC
+    """).fetchall()
+
+    # Ro'yxatdan o'tganlar soni
+    registered = c.execute(
+        "SELECT COUNT(*) FROM users WHERE is_registered=1"
+    ).fetchone()[0]
+
     conn.close()
     return {
         "total_users": total_users,
@@ -254,21 +315,40 @@ def db_get_stats() -> dict:
         "top_specialties": top_specialties,
         "top_doctors": top_doctors,
         "daily_stats": daily_stats,
+        "region_stats": region_stats,
+        "age_stats": age_stats,
+        "registered": registered,
     }
 
 # ===================== AI =====================
-async def ask_chatgpt(history: list[dict]) -> str:
+async def ask_chatgpt(history: list[dict], user_id: int = None) -> str:
     doctors    = db_all_doctors()
     specs      = ", ".join(set(d[2] for d in doctors))
+
+    # Foydalanuvchi profili AI ga uzatiladi
+    user_profile = ""
+    if user_id:
+        u = db_get_user(user_id)
+        if u and u["is_registered"]:
+            user_profile = (
+                f"\nFoydalanuvchi ma'lumotlari:\n"
+                f"- Ism: {u['full_name']}\n"
+                f"- Yosh guruhi: {u['age_group']}\n"
+                f"- Viloyat: {u['region']}\n"
+                "Bu ma'lumotlarni tavsiyada hisobga ol.\n"
+            )
+
     system_msg = {
         "role": "system",
         "content": (
             "Sen tibbiy yordamchi botsan. Vazifang:\n"
             "1. Foydalanuvchidan simptomlar haqida 2-3 savol so'ra.\n"
             "2. Yetarli ma'lumot to'plangach qaysi mutaxassis kerakligini aniqlash.\n"
-            f"Mavjud mutaxassislar: {specs}\n\n"
+            f"Mavjud mutaxassislar: {specs}\n"
+            f"{user_profile}\n"
             "QOIDALAR:\n"
             "- Faqat o'zbek tilida gapir.\n"
+            "- Foydalanuvchi yoshini hisobga olib tavsiya ber (bola, katta, keksa uchun farqli).\n"
             "- Tibbiy tashxis QO'YMA — faqat qaysi doktorga borish kerakligini ayt.\n"
             "- Jiddiy simptom (nafas qiyinligi, ko'krak og'rig'i) bo'lsa DARHOL tez yordam chaqirishni ayt.\n"
             "- Tavsiya berish uchun yetarli ma'lumot to'plangach javob oxiriga "
@@ -329,7 +409,7 @@ async def safe_edit(cq: CallbackQuery, text: str, reply_markup=None, parse_mode=
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
 
-    # ✅ ANALYTICS: foydalanuvchini ro'yxatga olish
+    # Foydalanuvchini bazaga qo'shish (yangi bo'lsa)
     db_upsert_user(
         user_id=msg.from_user.id,
         username=msg.from_user.username,
@@ -337,16 +417,111 @@ async def cmd_start(msg: Message, state: FSMContext):
     )
     db_log_event(user_id=msg.from_user.id, event_type="start")
 
+    # Ro'yxatdan o'tganmi tekshiramiz
+    user = db_get_user(msg.from_user.id)
+    if user and user["is_registered"]:
+        # Avval ro'yxatdan o'tgan — to'g'ri menyuga
+        await msg.answer(
+            f"👋 Xush kelibsiz, *{user['full_name']}*!\n\n"
+            "Quyidan bo'limni tanlang:",
+            reply_markup=main_kb(msg.from_user.id),
+            parse_mode="Markdown"
+        )
+    else:
+        # Yangi foydalanuvchi — ro'yxatdan o'tkazish
+        await state.set_state(UserReg.full_name)
+        await msg.answer(
+            "👋 *Shifo Yordamchi Botga Xush Kelibsiz!*\n\n"
+            "Bu bot orqali:\n"
+            "• 🤖 AI yordamida simptomlaringizni tahlil qilasiz\n"
+            "• 👨‍⚕️ Kerakli mutaxassisni topasiz\n"
+            "• 📞 Doktor bilan bog'lanasiz\n\n"
+            "Boshlash uchun bir necha savol:\n\n"
+            "👤 *Ismingizni kiriting:*",
+            parse_mode="Markdown"
+        )
+
+# --- Ro'yxatdan o'tish: Ism ---
+@dp.message(UserReg.full_name)
+async def reg_full_name(msg: Message, state: FSMContext):
+    name = msg.text.strip()
+    if len(name) < 2:
+        await msg.answer("⚠️ Iltimos, to'liq ismingizni kiriting:")
+        return
+    await state.update_data(full_name=name)
+    await state.set_state(UserReg.age)
+
+    rows = [
+        [InlineKeyboardButton(text="👶 18 yoshgacha",  callback_data="age_under18")],
+        [InlineKeyboardButton(text="🧑 18–35 yosh",    callback_data="age_18_35")],
+        [InlineKeyboardButton(text="🧔 36–55 yosh",    callback_data="age_36_55")],
+        [InlineKeyboardButton(text="👴 56 yoshdan yuqori", callback_data="age_over56")],
+    ]
     await msg.answer(
-        "👋 *Shifo Yordamchi Botga Xush Kelibsiz!*\n\n"
-        "Bu bot orqali:\n"
-        "• 🤖 AI yordamida simptomlaringizni tahlil qilishingiz\n"
-        "• 👨‍⚕️ Kerakli mutaxassisni topishingiz\n"
-        "• 📞 Doktor bilan bog'lanishingiz mumkin\n\n"
-        "Quyidan bo'limni tanlang:",
-        reply_markup=main_kb(msg.from_user.id),
+        f"✅ Salom, *{name}*!\n\n📅 *Yosh guruhingizni tanlang:*",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode="Markdown"
     )
+
+# --- Ro'yxatdan o'tish: Yosh ---
+AGE_LABELS = {
+    "age_under18": "18 yoshgacha",
+    "age_18_35":   "18–35 yosh",
+    "age_36_55":   "36–55 yosh",
+    "age_over56":  "56 yoshdan yuqori",
+}
+
+@dp.callback_query(F.data.startswith("age_"), UserReg.age)
+async def reg_age(cq: CallbackQuery, state: FSMContext):
+    age_group = AGE_LABELS.get(cq.data, cq.data)
+    await state.update_data(age_group=age_group)
+    await state.set_state(UserReg.region)
+
+    rows = [
+        [InlineKeyboardButton(text="🏙 Toshkent shahri",   callback_data="reg_Toshkent shahri")],
+        [InlineKeyboardButton(text="🌆 Toshkent viloyati", callback_data="reg_Toshkent viloyati")],
+        [InlineKeyboardButton(text="🌿 Xorazm",            callback_data="reg_Xorazm")],
+        [InlineKeyboardButton(text="🏔 Samarqand",         callback_data="reg_Samarqand")],
+        [InlineKeyboardButton(text="🌅 Farg'ona",          callback_data="reg_Farg'ona")],
+        [InlineKeyboardButton(text="🌾 Qashqadaryo",       callback_data="reg_Qashqadaryo")],
+        [InlineKeyboardButton(text="🏜 Buxoro",            callback_data="reg_Buxoro")],
+        [InlineKeyboardButton(text="🌊 Namangan",          callback_data="reg_Namangan")],
+        [InlineKeyboardButton(text="🗺 Boshqa viloyat",    callback_data="reg_Boshqa")],
+    ]
+    await cq.message.edit_text(
+        f"✅ *{age_group}* — saqlandi!\n\n📍 *Qaysi viloyatdasiz?*",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="Markdown"
+    )
+    await cq.answer()
+
+# --- Ro'yxatdan o'tish: Viloyat → Yakunlash ---
+@dp.callback_query(F.data.startswith("reg_"), UserReg.region)
+async def reg_region(cq: CallbackQuery, state: FSMContext):
+    region = cq.data.removeprefix("reg_")
+    data   = await state.get_data()
+
+    # Bazaga saqlash
+    db_complete_registration(
+        user_id=cq.from_user.id,
+        full_name=data["full_name"],
+        age_group=data["age_group"],
+        region=region
+    )
+    db_log_event(user_id=cq.from_user.id, event_type="registered")
+    await state.clear()
+
+    await cq.message.edit_text(
+        f"🎉 *Ro'yxatdan o'tish muvaffaqiyatli yakunlandi!*\n\n"
+        f"👤 Ism: *{data['full_name']}*\n"
+        f"📅 Yosh: *{data['age_group']}*\n"
+        f"📍 Viloyat: *{region}*\n\n"
+        "Endi AI shifokor sizga aniqroq tavsiya bera oladi.\n\n"
+        "Quyidan bo'limni tanlang:",
+        reply_markup=main_kb(cq.from_user.id),
+        parse_mode="Markdown"
+    )
+    await cq.answer()
 
 # ===================== CALLBACK: bosh sahifa =====================
 @dp.callback_query(F.data == "main")
@@ -394,7 +569,7 @@ async def ai_chat_msg(msg: Message, state: FSMContext):
 
     wait = await msg.answer("🔍 Tahlil qilinmoqda...")
     try:
-        ai_text  = await ask_chatgpt(history)
+        ai_text  = await ask_chatgpt(history, user_id=msg.from_user.id)
         history.append({"role": "assistant", "content": ai_text})
         await state.update_data(history=history)
 
@@ -575,15 +750,35 @@ async def cb_admin_stats(cq: CallbackQuery):
     if not daily_lines:
         daily_lines = "  Hali ma'lumot yo'q\n"
 
+    # Viloyatlar
+    region_lines = ""
+    for reg, cnt in stats["region_stats"]:
+        bar = "█" * min(cnt, 10)
+        region_lines += f"  • {reg}: {cnt} ta {bar}\n"
+    if not region_lines:
+        region_lines = "  Hali ma'lumot yo'q\n"
+
+    # Yosh guruhlari
+    age_lines = ""
+    for age, cnt in stats["age_stats"]:
+        age_lines += f"  • {age}: {cnt} ta\n"
+    if not age_lines:
+        age_lines = "  Hali ma'lumot yo'q\n"
+
     text = (
         f"📊 *Shifo Yordamchi — Statistika*\n"
         f"_{datetime.now().strftime('%d.%m.%Y %H:%M')}_\n\n"
         f"👥 *Foydalanuvchilar:*\n"
-        f"  • Jami: *{stats['total_users']} ta*\n"
+        f"  • Jami kirganlar: *{stats['total_users']} ta*\n"
+        f"  • Ro'yxatdan o'tganlar: *{stats['registered']} ta*\n"
         f"  • Bugun yangi: *{stats['today_users']} ta*\n\n"
         f"🩺 *AI So'rovlar:*\n"
         f"  • Jami: *{stats['total_queries']} ta*\n"
         f"  • Bu hafta: *{stats['week_queries']} ta*\n\n"
+        f"📍 *Viloyatlar bo'yicha:*\n"
+        f"{region_lines}\n"
+        f"📅 *Yosh guruhlari:*\n"
+        f"{age_lines}\n"
         f"🔬 *Eng ko'p so'raladigan mutaxassislar:*\n"
         f"{spec_lines}\n"
         f"👨‍⚕️ *Eng ko'p ko'rilgan shifokorlar:*\n"
