@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -47,6 +48,8 @@ DB = "medical_bot.db"
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
+
+    # --- Doctors jadvali ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS doctors (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,11 +61,36 @@ def init_db():
             is_active   INTEGER DEFAULT 1
         )
     """)
-    # Eski bazaga photo_id ustuni qo'shish (agar yo'q bo'lsa)
     try:
         c.execute("ALTER TABLE doctors ADD COLUMN photo_id TEXT")
     except Exception:
         pass
+
+    # --- Foydalanuvchilar jadvali (YANGI) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            first_name  TEXT,
+            joined_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen   DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # --- Analytics jadvali (YANGI) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS analytics (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER,
+            symptom_text  TEXT,
+            specialty     TEXT,
+            doctor_id     INTEGER,
+            event_type    TEXT,
+            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Demo doktorlar
     c.execute("SELECT COUNT(*) FROM doctors")
     if c.fetchone()[0] == 0:
         demo = [
@@ -78,9 +106,11 @@ def init_db():
         c.executemany(
             "INSERT INTO doctors (name, specialty, phone, description) VALUES (?,?,?,?)", demo
         )
+
     conn.commit()
     conn.close()
 
+# ===================== DB: DOCTORS =====================
 def db_all_doctors():
     conn = sqlite3.connect(DB)
     rows = conn.execute(
@@ -129,6 +159,102 @@ def db_update_doctor(doc_id: int, field: str, value: str):
     conn.execute(f"UPDATE doctors SET {field}=? WHERE id=?", (value, doc_id))
     conn.commit()
     conn.close()
+
+# ===================== DB: ANALYTICS (YANGI) =====================
+def db_upsert_user(user_id: int, username: str, first_name: str):
+    """Foydalanuvchini bazaga qo'shish yoki last_seen yangilash."""
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        INSERT INTO users (user_id, username, first_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            last_seen = CURRENT_TIMESTAMP,
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (user_id, username or "", first_name or ""))
+    conn.commit()
+    conn.close()
+
+def db_log_event(user_id: int, event_type: str,
+                 symptom_text: str = None,
+                 specialty: str = None,
+                 doctor_id: int = None):
+    """Har qanday muhim voqeani analytics jadvaliga yozish."""
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        INSERT INTO analytics (user_id, symptom_text, specialty, doctor_id, event_type)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, symptom_text, specialty, doctor_id, event_type))
+    conn.commit()
+    conn.close()
+
+def db_get_stats() -> dict:
+    """Pitch uchun asosiy statistikalar."""
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+
+    # Jami foydalanuvchilar
+    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    # Bugungi yangi foydalanuvchilar
+    today_users = c.execute("""
+        SELECT COUNT(*) FROM users
+        WHERE DATE(joined_at) = DATE('now')
+    """).fetchone()[0]
+
+    # Jami so'rovlar (AI suhbat)
+    total_queries = c.execute("""
+        SELECT COUNT(*) FROM analytics WHERE event_type = 'ai_recommendation'
+    """).fetchone()[0]
+
+    # Bu haftadagi so'rovlar
+    week_queries = c.execute("""
+        SELECT COUNT(*) FROM analytics
+        WHERE event_type = 'ai_recommendation'
+        AND created_at >= DATE('now', '-7 days')
+    """).fetchone()[0]
+
+    # Eng ko'p tavsiya qilingan 5 ta mutaxassis
+    top_specialties = c.execute("""
+        SELECT specialty, COUNT(*) as cnt
+        FROM analytics
+        WHERE event_type = 'ai_recommendation' AND specialty IS NOT NULL
+        GROUP BY specialty
+        ORDER BY cnt DESC
+        LIMIT 5
+    """).fetchall()
+
+    # Eng ko'p tanlangan 5 ta shifokor
+    top_doctors = c.execute("""
+        SELECT d.name, d.specialty, COUNT(*) as cnt
+        FROM analytics a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.event_type = 'doctor_viewed'
+        GROUP BY a.doctor_id
+        ORDER BY cnt DESC
+        LIMIT 5
+    """).fetchall()
+
+    # Kunlik so'rovlar (oxirgi 7 kun)
+    daily_stats = c.execute("""
+        SELECT DATE(created_at) as day, COUNT(*) as cnt
+        FROM analytics
+        WHERE event_type = 'ai_recommendation'
+        AND created_at >= DATE('now', '-7 days')
+        GROUP BY day
+        ORDER BY day
+    """).fetchall()
+
+    conn.close()
+    return {
+        "total_users": total_users,
+        "today_users": today_users,
+        "total_queries": total_queries,
+        "week_queries": week_queries,
+        "top_specialties": top_specialties,
+        "top_doctors": top_doctors,
+        "daily_stats": daily_stats,
+    }
 
 # ===================== AI =====================
 async def ask_chatgpt(history: list[dict]) -> str:
@@ -189,7 +315,6 @@ def stop_ai_kb() -> InlineKeyboardMarkup:
     ])
 
 async def safe_edit(cq: CallbackQuery, text: str, reply_markup=None, parse_mode="Markdown"):
-    """Rasmli xabarda edit_text ishlamaydi — o'chirib yangi xabar yuboramiz."""
     try:
         await cq.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception:
@@ -203,8 +328,17 @@ async def safe_edit(cq: CallbackQuery, text: str, reply_markup=None, parse_mode=
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
+
+    # ✅ ANALYTICS: foydalanuvchini ro'yxatga olish
+    db_upsert_user(
+        user_id=msg.from_user.id,
+        username=msg.from_user.username,
+        first_name=msg.from_user.first_name
+    )
+    db_log_event(user_id=msg.from_user.id, event_type="start")
+
     await msg.answer(
-        "👋 *Tibbiy Yordamchi Botga Xush Kelibsiz!*\n\n"
+        "👋 *Shifo Yordamchi Botga Xush Kelibsiz!*\n\n"
         "Bu bot orqali:\n"
         "• 🤖 AI yordamida simptomlaringizni tahlil qilishingiz\n"
         "• 👨‍⚕️ Kerakli mutaxassisni topishingiz\n"
@@ -219,7 +353,7 @@ async def cmd_start(msg: Message, state: FSMContext):
 async def cb_main(cq: CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_edit(cq,
-        "👋 *Tibbiy Yordamchi Bot*\n\nQuyidan bo'limni tanlang:",
+        "👋 *Shifo Yordamchi Bot*\n\nQuyidan bo'limni tanlang:",
         reply_markup=main_kb(cq.from_user.id),
     )
     await cq.answer()
@@ -229,6 +363,10 @@ async def cb_main(cq: CallbackQuery, state: FSMContext):
 async def cb_start_ai(cq: CallbackQuery, state: FSMContext):
     await state.set_state(AiChat.chatting)
     await state.update_data(history=[])
+
+    # ✅ ANALYTICS: AI suhbat boshlandi
+    db_log_event(user_id=cq.from_user.id, event_type="ai_chat_started")
+
     await cq.message.edit_text(
         "🩺 *AI suhbat boshlandi!*\n\n"
         "Qayeringiz og'riyapti yoki qanday noqulaylik sezmoqdasiz? "
@@ -242,7 +380,7 @@ async def cb_start_ai(cq: CallbackQuery, state: FSMContext):
 async def cb_stop_ai(cq: CallbackQuery, state: FSMContext):
     await state.clear()
     await cq.message.edit_text(
-        "👋 *Tibbiy Yordamchi Bot*\n\nQuyidan bo'limni tanlang:",
+        "👋 *Shifo Yordamchi Bot*\n\nQuyidan bo'limni tanlang:",
         reply_markup=main_kb(cq.from_user.id),
         parse_mode="Markdown"
     )
@@ -266,6 +404,14 @@ async def ai_chat_msg(msg: Message, state: FSMContext):
         await wait.delete()
 
         if specialty:
+            # ✅ ANALYTICS: AI tavsiya berdi — simptom va mutaxassisni saqlash
+            db_log_event(
+                user_id=msg.from_user.id,
+                event_type="ai_recommendation",
+                symptom_text=history[0]["content"][:300] if history else None,
+                specialty=specialty
+            )
+
             doctors = db_doctors_by_spec(specialty)
             rows    = []
             if doctors:
@@ -289,6 +435,9 @@ async def ai_chat_msg(msg: Message, state: FSMContext):
 # ===================== DOKTORLAR =====================
 @dp.callback_query(F.data == "all_doctors")
 async def cb_all_doctors(cq: CallbackQuery):
+    # ✅ ANALYTICS: doktorlar sahifasi ochildi
+    db_log_event(user_id=cq.from_user.id, event_type="doctors_viewed")
+
     doctors = db_all_doctors()
     if not doctors:
         await cq.message.edit_text("😔 Hozirda doktorlar mavjud emas.", reply_markup=back_kb())
@@ -338,6 +487,14 @@ async def cb_doc(cq: CallbackQuery):
         await cq.answer("Doktor topilmadi!", show_alert=True)
         return
 
+    # ✅ ANALYTICS: qaysi shifokor ko'rildi
+    db_log_event(
+        user_id=cq.from_user.id,
+        event_type="doctor_viewed",
+        specialty=d[2],
+        doctor_id=d[0]
+    )
+
     no_info  = d[4] or "Ma'lumot yo'q"
     photo_id = d[5] if len(d) > 5 else None
     text = (
@@ -346,7 +503,6 @@ async def cb_doc(cq: CallbackQuery):
         f"📞 Telefon: {d[3]}\n\n"
         f"ℹ️ {no_info}"
     )
-    digits = "".join(ch for ch in d[3] if ch.isdigit())
     rows = [
         [InlineKeyboardButton(text="◀️ Orqaga", callback_data=f"spec_{d[2]}")],
         [InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="main")],
@@ -354,7 +510,6 @@ async def cb_doc(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     if photo_id:
-        # Avval o'chirishga harakat qilamiz, bo'lmasa shunchaki yangi xabar yuboramiz
         try:
             await cq.message.delete()
         except Exception:
@@ -376,6 +531,7 @@ async def cb_admin(cq: CallbackQuery):
         await cq.answer("⛔ Ruxsat yo'q!", show_alert=True)
         return
     rows = [
+        [InlineKeyboardButton(text="📊 Statistika",                    callback_data="admin_stats")],
         [InlineKeyboardButton(text="➕ Yangi doktor qo'shish",         callback_data="admin_add")],
         [InlineKeyboardButton(text="✏️ Doktorni tahrirlash",           callback_data="admin_edit_list")],
         [InlineKeyboardButton(text="📋 Doktorlar ro'yxati (o'chirish)", callback_data="admin_list")],
@@ -387,6 +543,60 @@ async def cb_admin(cq: CallbackQuery):
     )
     await cq.answer()
 
+# ===================== ADMIN: STATISTIKA (YANGI) =====================
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(cq: CallbackQuery):
+    if cq.from_user.id not in ADMIN_IDS:
+        await cq.answer("⛔ Ruxsat yo'q!", show_alert=True)
+        return
+
+    stats = db_get_stats()
+
+    # Eng ko'p so'raladigan mutaxassislar
+    spec_lines = ""
+    for i, (spec, cnt) in enumerate(stats["top_specialties"], 1):
+        bar = "█" * min(cnt, 10)
+        spec_lines += f"  {i}. {spec}: {cnt} ta {bar}\n"
+    if not spec_lines:
+        spec_lines = "  Hali ma'lumot yo'q\n"
+
+    # Eng ko'p ko'rilgan shifokorlar
+    doc_lines = ""
+    for i, (name, spec, cnt) in enumerate(stats["top_doctors"], 1):
+        doc_lines += f"  {i}. {name} ({spec}): {cnt} marta\n"
+    if not doc_lines:
+        doc_lines = "  Hali ma'lumot yo'q\n"
+
+    # Kunlik statistika
+    daily_lines = ""
+    for day, cnt in stats["daily_stats"]:
+        bar = "▓" * min(cnt, 15)
+        daily_lines += f"  {day}: {cnt} ta {bar}\n"
+    if not daily_lines:
+        daily_lines = "  Hali ma'lumot yo'q\n"
+
+    text = (
+        f"📊 *Shifo Yordamchi — Statistika*\n"
+        f"_{datetime.now().strftime('%d.%m.%Y %H:%M')}_\n\n"
+        f"👥 *Foydalanuvchilar:*\n"
+        f"  • Jami: *{stats['total_users']} ta*\n"
+        f"  • Bugun yangi: *{stats['today_users']} ta*\n\n"
+        f"🩺 *AI So'rovlar:*\n"
+        f"  • Jami: *{stats['total_queries']} ta*\n"
+        f"  • Bu hafta: *{stats['week_queries']} ta*\n\n"
+        f"🔬 *Eng ko'p so'raladigan mutaxassislar:*\n"
+        f"{spec_lines}\n"
+        f"👨‍⚕️ *Eng ko'p ko'rilgan shifokorlar:*\n"
+        f"{doc_lines}\n"
+        f"📈 *Kunlik so'rovlar (7 kun):*\n"
+        f"{daily_lines}"
+    )
+
+    rows = [[InlineKeyboardButton(text="◀️ Admin panel", callback_data="admin")]]
+    await safe_edit(cq, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cq.answer()
+
+# ===================== ADMIN: RO'YXAT VA O'CHIRISH =====================
 @dp.callback_query(F.data == "admin_edit_list")
 async def cb_admin_edit_list(cq: CallbackQuery):
     if cq.from_user.id not in ADMIN_IDS:
@@ -419,7 +629,6 @@ async def cb_admin_edit_choose(cq: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminEdit.choose_field)
     await state.update_data(edit_doc_id=doc_id)
-    no_info  = d[4] or "Yo'q"
     has_photo = "✅ Bor" if d[5] else "❌ Yo'q"
     rows = [
         [InlineKeyboardButton(text=f"👤 Ism: {d[1]}",          callback_data="ef_name")],
@@ -464,6 +673,7 @@ async def cb_admin_del(cq: CallbackQuery):
     db_delete_doctor(doc_id)
     await cq.answer("✅ Doktor o'chirildi!", show_alert=True)
     rows = [
+        [InlineKeyboardButton(text="📊 Statistika",                    callback_data="admin_stats")],
         [InlineKeyboardButton(text="➕ Yangi doktor qo'shish",         callback_data="admin_add")],
         [InlineKeyboardButton(text="✏️ Doktorni tahrirlash",           callback_data="admin_edit_list")],
         [InlineKeyboardButton(text="📋 Doktorlar ro'yxati (o'chirish)", callback_data="admin_list")],
@@ -474,7 +684,7 @@ async def cb_admin_del(cq: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
-# --- Doktor qo'shish FSM ---
+# ===================== DOKTOR QO'SHISH FSM =====================
 @dp.callback_query(F.data == "admin_add")
 async def cb_admin_add(cq: CallbackQuery, state: FSMContext):
     if cq.from_user.id not in ADMIN_IDS:
@@ -519,7 +729,7 @@ async def adm_desc(msg: Message, state: FSMContext):
 @dp.message(AdminAdd.photo, F.photo)
 async def adm_photo(msg: Message, state: FSMContext):
     data     = await state.get_data()
-    photo_id = msg.photo[-1].file_id  # Eng yuqori sifatli rasm
+    photo_id = msg.photo[-1].file_id
     db_add_doctor(data["name"], data["spec"], data["phone"], data["desc"], photo_id)
     await state.clear()
     rows = [[InlineKeyboardButton(text="⚙️ Admin panel", callback_data="admin")]]
@@ -633,13 +843,11 @@ async def cb_edit_remove_photo(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, "✅ *Rasm o'chirildi!*", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
 
-
-
 # ===================== MAIN =====================
 async def main():
     init_db()
-    print("✅ Database tayyor")
-    print("🤖 Bot ishga tushdi!")
+    print("✅ Database tayyor (users + analytics jadvallar qo'shildi)")
+    print("🤖 Shifo Yordamchi Bot ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
