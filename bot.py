@@ -1,10 +1,16 @@
+# bot_pg.py — Railway PostgreSQL versiyasi
+# SQLite o'rniga psycopg2 ishlatiladi
+# O'zgarishlar: sqlite3 → psycopg2, ? → %s, AUTOINCREMENT → SERIAL
+
 import os
-import sqlite3
 import asyncio
 from datetime import datetime
+from contextlib import contextmanager
 from dotenv import load_dotenv
 load_dotenv()
 
+import psycopg2
+import psycopg2.extras
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -18,12 +24,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ===================== SOZLAMALAR =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
-ADMIN_IDS       = [int(x) for x in os.getenv("ADMIN_IDS", "123456789").split(",")]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "123456789").split(",")]
+DATABASE_URL   = os.getenv("DATABASE_URL")  # Railway avtomatik beradi
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
+
 
 # ===================== TARJIMALAR =====================
 TEXTS = {
@@ -236,223 +244,225 @@ class AdminEdit(StatesGroup):
     new_value    = State()
     new_photo    = State()
 
-# ===================== DATABASE =====================
-DB = "medical_bot.db"
+
+# ===================== DATABASE — PostgreSQL =====================
+# SQLite farqi:
+#   sqlite3.connect(DB)  →  psycopg2.connect(DATABASE_URL)
+#   ?                    →  %s
+#   AUTOINCREMENT        →  SERIAL
+#   INTEGER PRIMARY KEY  →  SERIAL PRIMARY KEY
+#   ON CONFLICT(user_id) DO UPDATE  →  ON CONFLICT (user_id) DO UPDATE (bir xil)
+
+@contextmanager
+def get_conn():
+    """PostgreSQL ulanish context manager."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
+    with get_conn() as conn:
+        c = conn.cursor()
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS doctors (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            specialty   TEXT NOT NULL,
-            phone       TEXT NOT NULL,
-            description TEXT,
-            photo_id    TEXT,
-            is_active   INTEGER DEFAULT 1
-        )
-    """)
-    try:
-        c.execute("ALTER TABLE doctors ADD COLUMN photo_id TEXT")
-    except Exception:
-        pass
+        # Doctors jadvali
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS doctors (
+                id          SERIAL PRIMARY KEY,
+                name        TEXT NOT NULL,
+                specialty   TEXT NOT NULL,
+                phone       TEXT NOT NULL,
+                description TEXT,
+                photo_id    TEXT,
+                is_active   INTEGER DEFAULT 1
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id       INTEGER PRIMARY KEY,
-            username      TEXT,
-            first_name    TEXT,
-            full_name     TEXT,
-            age_group     TEXT,
-            region        TEXT,
-            lang          TEXT DEFAULT 'uz',
-            is_registered INTEGER DEFAULT 0,
-            joined_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_seen     DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'uz'")
-    except Exception:
-        pass
+        # Users jadvali
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id       BIGINT PRIMARY KEY,
+                username      TEXT,
+                first_name    TEXT,
+                full_name     TEXT,
+                age_group     TEXT,
+                region        TEXT,
+                lang          TEXT DEFAULT 'uz',
+                is_registered INTEGER DEFAULT 0,
+                joined_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS analytics (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id       INTEGER,
-            symptom_text  TEXT,
-            specialty     TEXT,
-            doctor_id     INTEGER,
-            event_type    TEXT,
-            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        # Analytics jadvali
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS analytics (
+                id            SERIAL PRIMARY KEY,
+                user_id       BIGINT,
+                symptom_text  TEXT,
+                specialty     TEXT,
+                doctor_id     INTEGER,
+                event_type    TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    c.execute("SELECT COUNT(*) FROM doctors")
-    if c.fetchone()[0] == 0:
-        demo = [
-            ("Dr. Alisher Karimov",  "Kardiolog",       "+998901234567", "Yurak va qon tomir kasalliklari mutaxassisi. 15 yillik tajriba."),
-            ("Dr. Malika Tosheva",   "Nevropatolog",    "+998901234568", "Bosh og'rig'i, insult, asab kasalliklari bo'yicha mutaxassis."),
-            ("Dr. Bobur Yusupov",    "Gastroenterolog", "+998901234569", "Oshqozon, jigar, ichaklarni davolash mutaxassisi."),
-            ("Dr. Dilnoza Rahimova", "Pulmonolog",      "+998901234570", "O'pka va nafas yo'llari kasalliklari mutaxassisi."),
-            ("Dr. Jasur Mirzaev",    "Ortoped",         "+998901234571", "Suyak, bo'g'im va mushak kasalliklari bo'yicha mutaxassis."),
-            ("Dr. Feruza Nazarova",  "Endokrinolog",    "+998901234572", "Qandli diabet, qalqonsimon bez mutaxassisi."),
-            ("Dr. Sardor Holmatov",  "Terapevt",        "+998901234573", "Umumiy kasalliklar va profilaktika mutaxassisi."),
-            ("Dr. Nozima Ergasheva", "Ginekolog",       "+998901234574", "Xotin-qizlar sog'lig'i mutaxassisi."),
-        ]
-        c.executemany("INSERT INTO doctors (name,specialty,phone,description) VALUES (?,?,?,?)", demo)
-
-    conn.commit()
-    conn.close()
+        # Demo doktorlar — faqat jadval bo'sh bo'lsa
+        c.execute("SELECT COUNT(*) FROM doctors")
+        if c.fetchone()[0] == 0:
+            demo = [
+                ("Dr. Alisher Karimov",  "Kardiolog",       "+998901234567", "Yurak va qon tomir kasalliklari mutaxassisi. 15 yillik tajriba."),
+                ("Dr. Malika Tosheva",   "Nevropatolog",    "+998901234568", "Bosh og'rig'i, insult, asab kasalliklari bo'yicha mutaxassis."),
+                ("Dr. Bobur Yusupov",    "Gastroenterolog", "+998901234569", "Oshqozon, jigar, ichaklarni davolash mutaxassisi."),
+                ("Dr. Dilnoza Rahimova", "Pulmonolog",      "+998901234570", "O'pka va nafas yo'llari kasalliklari mutaxassisi."),
+                ("Dr. Jasur Mirzaev",    "Ortoped",         "+998901234571", "Suyak, bo'g'im va mushak kasalliklari bo'yicha mutaxassis."),
+                ("Dr. Feruza Nazarova",  "Endokrinolog",    "+998901234572", "Qandli diabet, qalqonsimon bez mutaxassisi."),
+                ("Dr. Sardor Holmatov",  "Terapevt",        "+998901234573", "Umumiy kasalliklar va profilaktika mutaxassisi."),
+                ("Dr. Nozima Ergasheva", "Ginekolog",       "+998901234574", "Xotin-qizlar sog'lig'i mutaxassisi."),
+            ]
+            c.executemany(
+                "INSERT INTO doctors (name,specialty,phone,description) VALUES (%s,%s,%s,%s)",
+                demo
+            )
 
 # ===================== DB: DOCTORS =====================
 def db_all_doctors():
-    conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE is_active=1"
-    ).fetchall()
-    conn.close()
-    return rows
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE is_active=1")
+        return c.fetchall()
 
 def db_doctors_by_spec(specialty):
-    conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE is_active=1 AND specialty LIKE ?",
-        (f"%{specialty}%",)
-    ).fetchall()
-    conn.close()
-    return rows
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE is_active=1 AND specialty ILIKE %s",
+            (f"%{specialty}%",)
+        )
+        return c.fetchall()
 
 def db_doctor_by_id(doc_id):
-    conn = sqlite3.connect(DB)
-    row = conn.execute(
-        "SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE id=?", (doc_id,)
-    ).fetchone()
-    conn.close()
-    return row
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id,name,specialty,phone,description,photo_id FROM doctors WHERE id=%s", (doc_id,))
+        return c.fetchone()
 
 def db_add_doctor(name, spec, phone, desc, photo_id=None):
-    conn = sqlite3.connect(DB)
-    conn.execute("INSERT INTO doctors (name,specialty,phone,description,photo_id) VALUES (?,?,?,?,?)",
-                 (name, spec, phone, desc, photo_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute(
+            "INSERT INTO doctors (name,specialty,phone,description,photo_id) VALUES (%s,%s,%s,%s,%s)",
+            (name, spec, phone, desc, photo_id)
+        )
 
 def db_delete_doctor(doc_id):
-    conn = sqlite3.connect(DB)
-    conn.execute("UPDATE doctors SET is_active=0 WHERE id=?", (doc_id,))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("UPDATE doctors SET is_active=0 WHERE id=%s", (doc_id,))
 
 def db_update_doctor(doc_id, field, value):
-    allowed = {"name","specialty","phone","description","photo_id"}
+    allowed = {"name", "specialty", "phone", "description", "photo_id"}
     if field not in allowed:
         return
-    conn = sqlite3.connect(DB)
-    conn.execute(f"UPDATE doctors SET {field}=? WHERE id=?", (value, doc_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute(f"UPDATE doctors SET {field}=%s WHERE id=%s", (value, doc_id))
 
 # ===================== DB: USERS =====================
 def db_upsert_user(user_id, username, first_name):
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        INSERT INTO users (user_id, username, first_name)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            last_seen  = CURRENT_TIMESTAMP,
-            username   = excluded.username,
-            first_name = excluded.first_name
-    """, (user_id, username or "", first_name or ""))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            INSERT INTO users (user_id, username, first_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                last_seen  = CURRENT_TIMESTAMP,
+                username   = EXCLUDED.username,
+                first_name = EXCLUDED.first_name
+        """, (user_id, username or "", first_name or ""))
 
 def db_get_user(user_id):
-    conn = sqlite3.connect(DB)
-    row = conn.execute(
-        "SELECT user_id,full_name,age_group,region,is_registered,lang FROM users WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
-    conn.close()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT user_id,full_name,age_group,region,is_registered,lang FROM users WHERE user_id=%s",
+            (user_id,)
+        )
+        row = c.fetchone()
     if not row:
         return None
     return {"user_id": row[0], "full_name": row[1], "age_group": row[2],
             "region": row[3], "is_registered": row[4], "lang": row[5] or "uz"}
 
 def db_set_lang(user_id, lang):
-    conn = sqlite3.connect(DB)
-    conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, user_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("UPDATE users SET lang=%s WHERE user_id=%s", (lang, user_id))
 
 def db_complete_registration(user_id, full_name, age_group, region, lang):
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        UPDATE users SET full_name=?, age_group=?, region=?, lang=?, is_registered=1
-        WHERE user_id=?
-    """, (full_name, age_group, region, lang, user_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            UPDATE users SET full_name=%s, age_group=%s, region=%s, lang=%s, is_registered=1
+            WHERE user_id=%s
+        """, (full_name, age_group, region, lang, user_id))
 
 # ===================== DB: ANALYTICS =====================
 def db_log_event(user_id, event_type, symptom_text=None, specialty=None, doctor_id=None):
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        INSERT INTO analytics (user_id,symptom_text,specialty,doctor_id,event_type)
-        VALUES (?,?,?,?,?)
-    """, (user_id, symptom_text, specialty, doctor_id, event_type))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            INSERT INTO analytics (user_id,symptom_text,specialty,doctor_id,event_type)
+            VALUES (%s,%s,%s,%s,%s)
+        """, (user_id, symptom_text, specialty, doctor_id, event_type))
 
 def db_get_stats():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    total_users   = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    today_users   = c.execute("SELECT COUNT(*) FROM users WHERE DATE(joined_at)=DATE('now')").fetchone()[0]
-    registered    = c.execute("SELECT COUNT(*) FROM users WHERE is_registered=1").fetchone()[0]
-    total_queries = c.execute("SELECT COUNT(*) FROM analytics WHERE event_type='ai_recommendation'").fetchone()[0]
-    week_queries  = c.execute("""
-        SELECT COUNT(*) FROM analytics
-        WHERE event_type='ai_recommendation' AND created_at>=DATE('now','-7 days')
-    """).fetchone()[0]
-    top_specialties = c.execute("""
-        SELECT specialty, COUNT(*) cnt FROM analytics
-        WHERE event_type='ai_recommendation' AND specialty IS NOT NULL
-        GROUP BY specialty ORDER BY cnt DESC LIMIT 5
-    """).fetchall()
-    top_doctors = c.execute("""
-        SELECT d.name, d.specialty, COUNT(*) cnt
-        FROM analytics a JOIN doctors d ON a.doctor_id=d.id
-        WHERE a.event_type='doctor_viewed'
-        GROUP BY a.doctor_id ORDER BY cnt DESC LIMIT 5
-    """).fetchall()
-    daily_stats = c.execute("""
-        SELECT DATE(created_at) day, COUNT(*) cnt FROM analytics
-        WHERE event_type='ai_recommendation' AND created_at>=DATE('now','-7 days')
-        GROUP BY day ORDER BY day
-    """).fetchall()
-    region_stats = c.execute("""
-        SELECT region, COUNT(*) cnt FROM users
-        WHERE region IS NOT NULL AND is_registered=1
-        GROUP BY region ORDER BY cnt DESC LIMIT 5
-    """).fetchall()
-    age_stats = c.execute("""
-        SELECT age_group, COUNT(*) cnt FROM users
-        WHERE age_group IS NOT NULL AND is_registered=1
-        GROUP BY age_group ORDER BY cnt DESC
-    """).fetchall()
-    lang_stats = c.execute("""
-        SELECT lang, COUNT(*) cnt FROM users
-        WHERE lang IS NOT NULL GROUP BY lang ORDER BY cnt DESC
-    """).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        c = conn.cursor()
+        total_users   = c.execute("SELECT COUNT(*) FROM users") or c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users"); total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE DATE(joined_at)=CURRENT_DATE"); today_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE is_registered=1"); registered = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM analytics WHERE event_type='ai_recommendation'"); total_queries = c.fetchone()[0]
+        c.execute("""
+            SELECT COUNT(*) FROM analytics
+            WHERE event_type='ai_recommendation' AND created_at >= NOW() - INTERVAL '7 days'
+        """); week_queries = c.fetchone()[0]
+        c.execute("""
+            SELECT specialty, COUNT(*) cnt FROM analytics
+            WHERE event_type='ai_recommendation' AND specialty IS NOT NULL
+            GROUP BY specialty ORDER BY cnt DESC LIMIT 5
+        """); top_specialties = c.fetchall()
+        c.execute("""
+            SELECT d.name, d.specialty, COUNT(*) cnt
+            FROM analytics a JOIN doctors d ON a.doctor_id=d.id
+            WHERE a.event_type='doctor_viewed'
+            GROUP BY d.name, d.specialty ORDER BY cnt DESC LIMIT 5
+        """); top_doctors = c.fetchall()
+        c.execute("""
+            SELECT DATE(created_at) day, COUNT(*) cnt FROM analytics
+            WHERE event_type='ai_recommendation' AND created_at >= NOW() - INTERVAL '7 days'
+            GROUP BY day ORDER BY day
+        """); daily_stats = c.fetchall()
+        c.execute("""
+            SELECT region, COUNT(*) cnt FROM users
+            WHERE region IS NOT NULL AND is_registered=1
+            GROUP BY region ORDER BY cnt DESC LIMIT 5
+        """); region_stats = c.fetchall()
+        c.execute("""
+            SELECT age_group, COUNT(*) cnt FROM users
+            WHERE age_group IS NOT NULL AND is_registered=1
+            GROUP BY age_group ORDER BY cnt DESC
+        """); age_stats = c.fetchall()
+        c.execute("""
+            SELECT lang, COUNT(*) cnt FROM users
+            WHERE lang IS NOT NULL GROUP BY lang ORDER BY cnt DESC
+        """); lang_stats = c.fetchall()
+
     return dict(total_users=total_users, today_users=today_users, registered=registered,
                 total_queries=total_queries, week_queries=week_queries,
                 top_specialties=top_specialties, top_doctors=top_doctors,
                 daily_stats=daily_stats, region_stats=region_stats,
                 age_stats=age_stats, lang_stats=lang_stats)
+
 
 # ===================== FOYDALANUVCHI TILINI OLISH =====================
 def get_lang(user_id: int) -> str:
@@ -1050,10 +1060,15 @@ async def cb_admin_del(cq: CallbackQuery):
     await safe_edit(cq, "⚙️ *Admin Panel*", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 # ===================== MAIN =====================
+# ===================== MAIN =====================
 async def main():
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL topilmadi! Railway da PostgreSQL qo'shing.")
+        return
     init_db()
-    print("✅ Database tayyor")
-    print("🌐 Ko'p tilli bot ishga tushdi! (O'zbek | Русский | English)")
+    print("✅ PostgreSQL ulanish muvaffaqiyatli")
+    print("✅ Jadvallar tayyor")
+    print("🤖 Shifo Yordamchi Bot ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
