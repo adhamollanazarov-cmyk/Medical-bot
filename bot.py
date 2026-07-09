@@ -417,45 +417,68 @@ def db_log_event(user_id, event_type, symptom_text=None, specialty=None, doctor_
 def db_get_stats():
     with get_conn() as conn:
         c = conn.cursor()
-        total_users   = c.execute("SELECT COUNT(*) FROM users") or c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users"); total_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE DATE(joined_at)=CURRENT_DATE"); today_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE is_registered=1"); registered = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM analytics WHERE event_type='ai_recommendation'"); total_queries = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM users WHERE DATE(joined_at) = CURRENT_DATE")
+        today_users = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM users WHERE is_registered = 1")
+        registered = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM analytics WHERE event_type = 'ai_recommendation'")
+        total_queries = c.fetchone()[0]
+
         c.execute("""
             SELECT COUNT(*) FROM analytics
-            WHERE event_type='ai_recommendation' AND created_at >= NOW() - INTERVAL '7 days'
-        """); week_queries = c.fetchone()[0]
+            WHERE event_type = 'ai_recommendation'
+              AND created_at >= NOW() - INTERVAL '7 days'
+        """)
+        week_queries = c.fetchone()[0]
+
         c.execute("""
-            SELECT specialty, COUNT(*) cnt FROM analytics
-            WHERE event_type='ai_recommendation' AND specialty IS NOT NULL
+            SELECT specialty, COUNT(*) AS cnt FROM analytics
+            WHERE event_type = 'ai_recommendation' AND specialty IS NOT NULL
             GROUP BY specialty ORDER BY cnt DESC LIMIT 5
-        """); top_specialties = c.fetchall()
+        """)
+        top_specialties = c.fetchall()
+
         c.execute("""
-            SELECT d.name, d.specialty, COUNT(*) cnt
-            FROM analytics a JOIN doctors d ON a.doctor_id=d.id
-            WHERE a.event_type='doctor_viewed'
+            SELECT d.name, d.specialty, COUNT(*) AS cnt
+            FROM analytics a JOIN doctors d ON a.doctor_id = d.id
+            WHERE a.event_type = 'doctor_viewed'
             GROUP BY d.name, d.specialty ORDER BY cnt DESC LIMIT 5
-        """); top_doctors = c.fetchall()
+        """)
+        top_doctors = c.fetchall()
+
         c.execute("""
-            SELECT DATE(created_at) day, COUNT(*) cnt FROM analytics
-            WHERE event_type='ai_recommendation' AND created_at >= NOW() - INTERVAL '7 days'
+            SELECT DATE(created_at) AS day, COUNT(*) AS cnt FROM analytics
+            WHERE event_type = 'ai_recommendation'
+              AND created_at >= NOW() - INTERVAL '7 days'
             GROUP BY day ORDER BY day
-        """); daily_stats = c.fetchall()
+        """)
+        daily_stats = c.fetchall()
+
         c.execute("""
-            SELECT region, COUNT(*) cnt FROM users
-            WHERE region IS NOT NULL AND is_registered=1
+            SELECT region, COUNT(*) AS cnt FROM users
+            WHERE region IS NOT NULL AND is_registered = 1
             GROUP BY region ORDER BY cnt DESC LIMIT 5
-        """); region_stats = c.fetchall()
+        """)
+        region_stats = c.fetchall()
+
         c.execute("""
-            SELECT age_group, COUNT(*) cnt FROM users
-            WHERE age_group IS NOT NULL AND is_registered=1
+            SELECT age_group, COUNT(*) AS cnt FROM users
+            WHERE age_group IS NOT NULL AND is_registered = 1
             GROUP BY age_group ORDER BY cnt DESC
-        """); age_stats = c.fetchall()
+        """)
+        age_stats = c.fetchall()
+
         c.execute("""
-            SELECT lang, COUNT(*) cnt FROM users
+            SELECT lang, COUNT(*) AS cnt FROM users
             WHERE lang IS NOT NULL GROUP BY lang ORDER BY cnt DESC
-        """); lang_stats = c.fetchall()
+        """)
+        lang_stats = c.fetchall()
 
     return dict(total_users=total_users, today_users=today_users, registered=registered,
                 total_queries=total_queries, week_queries=week_queries,
@@ -807,7 +830,11 @@ async def cb_admin_stats(cq: CallbackQuery):
     if cq.from_user.id not in ADMIN_IDS:
         await cq.answer("⛔ Ruxsat yo'q!", show_alert=True)
         return
-    s = db_get_stats()
+    try:
+        s = db_get_stats()
+    except Exception as e:
+        await cq.answer(f"❌ Xatolik: {e}", show_alert=True)
+        return
 
     def fmt_list(items, bar=True):
         if not items:
