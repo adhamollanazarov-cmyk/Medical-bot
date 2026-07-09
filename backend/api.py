@@ -2,7 +2,7 @@
 # Bot (bot_pg.py) bilan BIR XIL PostgreSQL bazasidan foydalanadi (Railway).
 #
 # Ishga tushirish (lokal):
-#   pip install -r requirements-api.txt
+#   pip install -r requirements.txt
 #   uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 #
 # Railway'da: bu faylni bot bilan bir loyihada alohida "service" sifatida

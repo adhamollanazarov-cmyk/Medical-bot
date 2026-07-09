@@ -8,7 +8,7 @@ from datetime import datetime
 from contextlib import contextmanager
 from dotenv import load_dotenv
 load_dotenv()
-
+from aiogram.types import WebAppInfo
 import psycopg2
 import psycopg2.extras
 from openai import AsyncOpenAI
@@ -530,6 +530,10 @@ def lang_kb() -> InlineKeyboardMarkup:
 
 def main_kb(user_id: int, lang: str) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton(
+            text="🌐 Mini App ni ochish",
+            web_app=WebAppInfo(url="https://SIZNING-USERNAME.github.io/REPO-NOMI/")
+        )],
         [InlineKeyboardButton(text=t(lang,"btn_ai"),      callback_data="start_ai")],
         [InlineKeyboardButton(text=t(lang,"btn_doctors"), callback_data="all_doctors")],
         [InlineKeyboardButton(text=t(lang,"btn_by_spec"), callback_data="by_spec")],
