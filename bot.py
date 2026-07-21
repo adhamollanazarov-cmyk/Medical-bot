@@ -532,7 +532,7 @@ def main_kb(user_id: int, lang: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
             text="🌐 Mini App ni ochish",
-            web_app=WebAppInfo(url="https://shifo-mini-web-app.vercel.app")
+            web_app=WebAppInfo(url="https://medaai-production-5029.up.railway.app/app/")
         )],
         [InlineKeyboardButton(text=t(lang,"btn_ai"),      callback_data="start_ai")],
         [InlineKeyboardButton(text=t(lang,"btn_doctors"), callback_data="all_doctors")],
